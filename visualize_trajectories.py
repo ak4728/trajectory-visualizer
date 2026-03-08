@@ -109,7 +109,7 @@ def classify_direction(trajectory: Trajectory, inverted: bool = False) -> str:
     
     # Handle near-zero movement
     if abs(dx) < 1 and abs(dy) < 1:
-        return "STATIONARY"
+        return "UNCLASSIFIED"
     
     import math
     angle = math.degrees(math.atan2(dy, dx))  # -180 to 180
@@ -205,7 +205,7 @@ def classify_direction_with_turn(trajectory: Trajectory, inverted: bool = False)
     direction = classify_direction(trajectory, inverted=inverted)
     turn = classify_turn(trajectory, inverted=inverted)
     
-    if direction in ("UNKNOWN", "STATIONARY"):
+    if direction in ("UNKNOWN", "UNCLASSIFIED"):
         return direction
     
     return f"{direction}-{turn}"
@@ -280,7 +280,7 @@ def compute_lane_thresholds(trajectories: list[Trajectory], inverted: bool = Fal
     for traj in trajectories:
         direction, turn_type, turn_code = get_movement_base(traj, inverted)
         
-        if direction in ("UNKNOWN", "STATIONARY"):
+        if direction in ("UNKNOWN", "UNCLASSIFIED"):
             continue
         if turn_type in ("Straight", "Short"):
             continue  # No lane distinction for straights
@@ -301,12 +301,187 @@ def compute_lane_thresholds(trajectories: list[Trajectory], inverted: bool = Fal
     return thresholds
 
 
+def ends_in_wb_ramp(trajectory: Trajectory) -> bool:
+    """Check if trajectory ends in the WB ramp exit zone (x: 3700-3860, y: 600-800)."""
+    if len(trajectory.points) < 2:
+        return False
+    # Check last few points to ensure vehicle is exiting via ramp
+    end_points = trajectory.points[-5:] if len(trajectory.points) >= 5 else trajectory.points
+    for x, y in end_points:
+        if 3700 <= x <= 3860 and 600 <= y <= 800:
+            return True
+    return False
+
+
+def get_endpoint_zone(trajectory: Trajectory) -> tuple[float, float]:
+    """Get the average endpoint position (last 5 points)."""
+    if len(trajectory.points) < 2:
+        return trajectory.points[-1]
+    end_points = trajectory.points[-5:] if len(trajectory.points) >= 5 else trajectory.points
+    avg_x = sum(p[0] for p in end_points) / len(end_points)
+    avg_y = sum(p[1] for p in end_points) / len(end_points)
+    return (avg_x, avg_y)
+
+
+def get_lane_at_x(trajectory: Trajectory, target_x: float, x_tolerance: float = 100) -> float | None:
+    """Get the y-coordinate where trajectory crosses a specific x value.
+    
+    Returns the average y of points within x_tolerance of target_x.
+    """
+    nearby_points = [
+        (x, y) for x, y in trajectory.points 
+        if abs(x - target_x) <= x_tolerance
+    ]
+    if not nearby_points:
+        return None
+    return sum(y for _, y in nearby_points) / len(nearby_points)
+
+
+def classify_wbl_lane(trajectory: Trajectory) -> str:
+    """Classify WB left turn lane based on starting lane position.
+    
+    Uses y-coordinate at x~1500 to determine which lane the vehicle started in.
+    Lane 1 (inner): y ~1050-1100
+    Lane 2 (outer): y > 1100
+    
+    Trajectories reaching x >= 2500 are reclassified as WBT (through movement).
+    """
+    # Check if trajectory reaches x >= 2500 (not a complete left turn)
+    max_x = max(x for x, y in trajectory.points)
+    if max_x >= 2500:
+        return "WBT"  # Not a proper WBL - goes too far east, reclassify as through
+    
+    # Get y position around x=1500 where we can see the lane separation
+    lane_y = get_lane_at_x(trajectory, target_x=1500, x_tolerance=200)
+    
+    if lane_y is None:
+        # Fallback: use early points
+        if len(trajectory.points) >= 10:
+            early_points = trajectory.points[:10]
+            lane_y = sum(y for _, y in early_points) / len(early_points)
+        else:
+            return "WBL1"  # default
+    
+    # Lane 1 is inner (lower y ~1050-1100), Lane 2 is outer (higher y)
+    lane_y_threshold = 1100
+    
+    if lane_y < lane_y_threshold:
+        return "WBL1"
+    else:
+        return "WBL2"
+
+
+def classify_nbl_lane(trajectory: Trajectory) -> str:
+    """Classify NB left turn lane based on start/pass-through position.
+    
+    NBL1: Starts in or passes through right lane (x: 1766-1865, y: 620-720)
+    NBL2: Passes through left lane (x: 1650-1780, y: 650-720)
+    
+    The turn classifier already determined this is a left turn, so we just need
+    to determine which lane based on the starting position.
+    """
+    # Check for NBL1: passes through right lane zone (x: 1766-1900, y: 620-720)
+    passes_nbl1_zone = any(
+        (1766 <= x <= 1885) and (655 <= y <= 679)
+        for x, y in trajectory.points
+    )
+    if passes_nbl1_zone:
+        return "NBL1"
+    
+    # Check for NBL2: passes through left lane zone (x: 1650-1780, y: 650-720)
+    passes_nbl2_zone = any(
+        (1650 <= x <= 1766) and (669 <= y <= 750)
+        for x, y in trajectory.points
+    )
+    if passes_nbl2_zone:
+        return "NBL2"
+    
+    # Fallback: use x position at y~680 to determine lane
+    nearby_y_points = [
+        (x, y) for x, y in trajectory.points 
+        if 620 <= y <= 750
+    ]
+    if nearby_y_points:
+        avg_x = sum(x for x, y in nearby_y_points) / len(nearby_y_points)
+        return "NBL1" if avg_x >= 1766 else "NBL2"
+    
+    # Default to NBL2 if no points in expected y range
+    return "NBL2"
+
+
+def classify_eb_movement(trajectory: Trajectory) -> str:
+    """Classify EB (Eastbound) movements based on trajectory shape.
+    
+    Lane boundaries defined by line segments:
+    - EBR2: trajectories passing through line (2379, 846) to (2418, 732) - upper lane
+    - EBR1: trajectories passing through line (2379, 846) to (2352, 955) - lower lane
+    - EBR1 with end x < 1600 are actually EBT trips
+    
+    EBL: Left turn - Y must increase overall
+    EB-Ramp: U-turn to ramp - Y decreasing, X first decreases then increases
+    EBT: Through - already handled separately
+    """
+    if len(trajectory.points) < 5:
+        return "EBT"  # Short trajectory, classify as through
+    
+    # Get overall trajectory stats
+    start_y = trajectory.points[0][1]
+    end_y = trajectory.points[-1][1]
+    start_x = trajectory.points[0][0]
+    end_x = trajectory.points[-1][0]
+    
+    y_change = end_y - start_y
+    x_change = end_x - start_x
+    
+    # Check for X pattern (decrease then increase) for ramp
+    mid_idx = len(trajectory.points) // 2
+    mid_x = trajectory.points[mid_idx][0]
+    x_decreases_then_increases = (mid_x < start_x) and (end_x > mid_x)
+    
+    # EB-Ramp: Y decreasing, X first decreases then increases
+    if y_change < -50 and x_decreases_then_increases:
+        return "EB-Ramp"
+    
+    # EBL: Left turn - Y must increase overall
+    if y_change > 50:
+        # Use starting lane to determine EBL1 vs EBL2
+        lane_y = get_lane_at_x(trajectory, target_x=2500, x_tolerance=200)
+        if lane_y is None:
+            lane_y = start_y
+        if lane_y < 900:
+            return "EBL1"
+        else:
+            return "EBL2"
+    
+    # EBR: Right turns - Y decreases, X decreases
+    if y_change < -50 and x_change < -50:
+        # Classify lane based on position at x ~2400 (near boundary intersection point)
+        # EBR2 line: (2379, 846) to (2418, 732) - upper lane (y < 846 at x~2400)
+        # EBR1 line: (2379, 846) to (2352, 955) - lower lane (y >= 846 at x~2400)
+        lane_y = get_lane_at_x(trajectory, target_x=2400, x_tolerance=150)
+        if lane_y is None:
+            lane_y = start_y
+        
+        # Check which lane boundary the trajectory is closer to
+        if lane_y < 846:
+            return "EBR2"  # Upper lane (through line to 732)
+        else:
+            # Lower lane (through line to 955)
+            # But if destination x < 1600, it's actually EBT
+            if end_x < 1600:
+                return "EBT"
+            return "EBR1"
+    
+    # Default: classify as through if doesn't match turning patterns
+    return "EBT"
+
+
 def classify_full(trajectory: Trajectory, inverted: bool = False, 
                   lane_thresholds: dict[str, float] | None = None,
                   lane_threshold: float = 150.0) -> str:
     """Classify trajectory with direction, turn, and lane.
     
-    Returns labels like: 'NBL1', 'NBL2', 'EBT', 'EBR1', 'WBR', 'EB-Ramp1', etc.
+    Returns labels like: 'NBL1', 'NBL2', 'EBT', 'EBR1', 'WBR', 'EB-Ramp1', 'WB-Ramp2', etc.
     Format: {Direction}{Turn}{Lane}
     - Direction: NB, SB, EB, WB (diagonal directions are excluded)
     - Turn: L (Left), R (Right), T (Through/Straight), U (UTurn -> Ramp for EB)
@@ -318,19 +493,134 @@ def classify_full(trajectory: Trajectory, inverted: bool = False,
     """
     direction, turn_type, turn_code = get_movement_base(trajectory, inverted)
     
-    if direction in ("UNKNOWN", "STATIONARY"):
+    if direction in ("UNKNOWN", "UNCLASSIFIED"):
         return direction
     
-    # Exclude diagonal directions (NE, NW, SE, SW) - these are typically misclassifications
-    if direction in ("NE", "NW", "SE", "SW"):
-        return "EXCLUDE"
+    # Reclassify diagonal directions to nearest cardinal direction
+    if direction == "NE":
+        direction = "NB"  # Reclassify as northbound
+    elif direction == "NW":
+        direction = "NB"  # Reclassify as northbound
+    elif direction == "SE":
+        direction = "SB"  # Reclassify as southbound
+    elif direction == "SW":
+        direction = "SB"  # Reclassify as southbound
+    
+    # SB trips must start in the south portion of image (high y), otherwise reclassify
+    if direction == "SB":
+        start_x, start_y = trajectory.points[0]
+        # SB traffic enters from bottom of image (y > 1300) or mid-intersection (x: 1800-2200)
+        is_valid_sb_start = (start_y > 1300) or (1800 <= start_x <= 2200 and start_y > 1100)
+        if not is_valid_sb_start:
+            # Reclassify based on trajectory shape
+            y_change = trajectory.points[-1][1] - trajectory.points[0][1]
+            x_change = trajectory.points[-1][0] - trajectory.points[0][0]
+            if abs(x_change) > abs(y_change):
+                direction = "EB" if x_change > 0 else "WB"
+            else:
+                direction = "NB"
+    
+    # WB vehicles passing through vertical line at x=3343 between y=829 and y=1122 are ramp trips
+    if direction == "WB":
+        passes_ramp_gate = any(
+            3300 <= x <= 3386 and 829 <= y <= 1122
+            for x, y in trajectory.points
+        )
+        if passes_ramp_gate:
+            return "WB-Ramp2"
+    
+    # WB vehicles going to ramp - check ramp zone FIRST before WBL
+    if direction == "WB" and ends_in_wb_ramp(trajectory):
+        # Use starting lane to determine ramp lane
+        lane_y = get_lane_at_x(trajectory, target_x=1500, x_tolerance=200)
+        if lane_y is None and len(trajectory.points) >= 10:
+            early_points = trajectory.points[:10]
+            lane_y = sum(y for _, y in early_points) / len(early_points)
+        lane = "1" if lane_y is not None and lane_y < 1100 else "2"
+        return f"WB-Ramp{lane}"
+    
+    # WBL: classify by starting lane position
+    if direction == "WB" and turn_type == "Left":
+        return classify_wbl_lane(trajectory)
+    
+    # WBT: reclassify if trajectory goes below y=1062 (that's a ramp or turning trip)
+    if direction == "WB" and turn_type in ("Straight", "Short"):
+        min_y = min(y for x, y in trajectory.points)
+        max_x = max(x for x, y in trajectory.points)
+        if min_y < 1062:
+            # Check if trajectory has points with y < 1000 while x is 1750-2250
+            # Those are turning trips (WBL), not ramp trips
+            has_turning_pattern = any(
+                y < 1000 and 1750 <= x <= 2250 
+                for x, y in trajectory.points
+            )
+            if has_turning_pattern:
+                # This is a turning trip, classify as WBL
+                return classify_wbl_lane(trajectory)
+            # Otherwise it's a ramp trip
+            return "WB-Ramp2"
+        return "WBT"
+    
+    # WBR: check if it's actually a ramp trip (x > 3000)
+    if direction == "WB" and turn_type == "Right":
+        max_x = max(x for x, y in trajectory.points)
+        if max_x > 3000:
+            return "WB-Ramp2"  # Ramp trip, not right turn
+        return "WBR"
+    
+    # EB trips passing through vertical line at x=3370 between y=827 and y=844 are EB-Ramp trips
+    if direction == "EB":
+        passes_eb_ramp_gate = any(
+            3330 <= x <= 3410 and 827 <= y <= 844
+            for x, y in trajectory.points
+        )
+        if passes_eb_ramp_gate:
+            return "EB-Ramp"
+    
+    # EB trips passing through vertical line at x=1446 between y=841 and y=1035 are EBT trips
+    if direction == "EB":
+        passes_ebt_gate = any(
+            1400 <= x <= 1490 and 841 <= y <= 1035
+            for x, y in trajectory.points
+        )
+        if passes_ebt_gate:
+            return "EBT"
+    
+    # EBT: reclassify if trajectory goes below y=750 (that's a turning trip)
+    if direction == "EB" and turn_type in ("Straight", "Short"):
+        min_y = min(y for x, y in trajectory.points)
+        if min_y < 750:
+            return classify_eb_movement(trajectory)  # Reclassify as EB turn
+        return "EBT"
+    
+    # EB turning movements (Left, Right, UTurn) - use specialized classifier
+    if direction == "EB" and turn_type in ("Left", "Right", "UTurn"):
+        return classify_eb_movement(trajectory)
+    
+    # NBL: classify by starting lane position and destination
+    if direction == "NB" and turn_type == "Left":
+        return classify_nbl_lane(trajectory)
+    
+    # NBT: must start in north zone and pass through gate (x: 1700-2100, y: ~1320)
+    if direction == "NB" and turn_type in ("Straight", "Short"):
+        start_x, start_y = trajectory.points[0]
+        # NB trips start at low y (top of image), around y~450-500, x~1650-1750
+        valid_start = (1600 <= start_x <= 1800) and (start_y <= 550)
+        passes_nbt_gate = any(
+            (1700 <= x <= 2100) and (1250 <= y <= 1400)
+            for x, y in trajectory.points
+        )
+        if valid_start and passes_nbt_gate:
+            return "NBT"
+        # If doesn't match NBT pattern, reclassify to UNCLASSIFIED
+        return "UNCLASSIFIED"
     
     # No lane distinction for straight movements
     if turn_type in ("Straight", "Short"):
         return f"{direction}{turn_code}"
     
     # Right turns: only EB has two lanes, others have one
-    if turn_type == "Right" and direction != "EB":
+    if turn_type == "Right":
         return f"{direction}{turn_code}"
     
     # Get lane designation for left turns, U-turns, and EB right turns
@@ -345,10 +635,6 @@ def classify_full(trajectory: Trajectory, inverted: bool = False,
     
     # Inner lane = tighter turn = smaller deviation
     lane = "1" if deviation < threshold else "2"
-    
-    # EBU (U-turn on eastbound) is actually a ramp movement
-    if direction == "EB" and turn_type == "UTurn":
-        return f"EB-Ramp{lane}"
     
     return f"{direction}{turn_code}{lane}"
 
@@ -385,6 +671,7 @@ DIRECTION_COLORS = {
     "EBR1": "#d94701",
     "EBR2": "#a63603",
     "EBU": "#e6550d",
+    "EB-Ramp": "#ffcc00",
     "EB-Ramp1": "#ffcc00",
     "EB-Ramp2": "#ffaa00",
     # Westbound - Blues
@@ -401,6 +688,10 @@ DIRECTION_COLORS = {
     "WBR1": "#08519c",
     "WBR2": "#2171b5",
     "WBU": "#4292c6",
+    "WBU1": "#4292c6",
+    "WBU2": "#c6dbef",
+    "WB-Ramp1": "#00bfff",
+    "WB-Ramp2": "#87ceeb",
     # Northbound - Reds
     "NB": "#d62728",
     "NB-Straight": "#d62728",
@@ -487,7 +778,7 @@ DIRECTION_COLORS = {
     "SWU": "#9c7a72",
     # Special
     "UNKNOWN": "#7f7f7f",
-    "STATIONARY": "#bcbd22",
+    "UNCLASSIFIED": "#bcbd22",
 }
 
 
@@ -876,6 +1167,22 @@ def generate_html(
             font-size: 12px;
             color: #888;
         }}
+        .pixel-coords {{
+            position: fixed;
+            top: 10px;
+            right: 10px;
+            background: rgba(0, 0, 0, 0.8);
+            color: #00ff00;
+            padding: 10px 15px;
+            border-radius: 5px;
+            font-family: monospace;
+            font-size: 14px;
+            z-index: 1000;
+            pointer-events: none;
+        }}
+        .pixel-coords.hidden {{
+            display: none;
+        }}
     </style>
 </head>
 <body>
@@ -896,13 +1203,14 @@ def generate_html(
         </div>
     </div>
     <div class="main-content">
-        <div class="visualization-container">
+        <div class="visualization-container" id="vizContainer">
             <img src="data:{mime_type};base64,{img_data}" alt="Drone footage" width="{img_w}" height="{img_h}">
             <svg viewBox="0 0 {img_w} {img_h}" preserveAspectRatio="xMidYMid meet">
                 {svg_groups}
             </svg>
         </div>
     </div>
+    <div id="pixelCoords" class="pixel-coords hidden">X: 0, Y: 0</div>
     
     <script>
         function toggleGroup(group) {{
@@ -1002,6 +1310,51 @@ def generate_html(
         function showThroughs() {{
             showByPattern(/T$/);
         }}
+        
+        // Pixel coordinate display on middle click
+        const vizContainer = document.getElementById('vizContainer');
+        const pixelCoords = document.getElementById('pixelCoords');
+        const imgElement = vizContainer.querySelector('img');
+        
+        vizContainer.addEventListener('auxclick', function(e) {{
+            if (e.button === 1) {{  // Middle mouse button
+                e.preventDefault();
+                
+                const rect = imgElement.getBoundingClientRect();
+                const scaleX = {img_w} / rect.width;
+                const scaleY = {img_h} / rect.height;
+                
+                const x = Math.round((e.clientX - rect.left) * scaleX);
+                const y = Math.round((e.clientY - rect.top) * scaleY);
+                
+                pixelCoords.textContent = `X: ${{x}}, Y: ${{y}}`;
+                pixelCoords.classList.remove('hidden');
+            }}
+        }});
+        
+        // Also support regular click with Ctrl key as alternative
+        vizContainer.addEventListener('click', function(e) {{
+            if (e.ctrlKey) {{
+                e.preventDefault();
+                
+                const rect = imgElement.getBoundingClientRect();
+                const scaleX = {img_w} / rect.width;
+                const scaleY = {img_h} / rect.height;
+                
+                const x = Math.round((e.clientX - rect.left) * scaleX);
+                const y = Math.round((e.clientY - rect.top) * scaleY);
+                
+                pixelCoords.textContent = `X: ${{x}}, Y: ${{y}}`;
+                pixelCoords.classList.remove('hidden');
+            }}
+        }});
+        
+        // Prevent default middle-click scroll behavior
+        vizContainer.addEventListener('mousedown', function(e) {{
+            if (e.button === 1) {{
+                e.preventDefault();
+            }}
+        }});
     </script>
 </body>
 </html>
