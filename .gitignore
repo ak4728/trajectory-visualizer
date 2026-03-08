@@ -1,6 +1,6 @@
-# Large data files
-*.csv
-trajectories*.csv
+# Input data files (too large for git)
+trajectories.csv
+DroneFootage*.png
 
 # Generated outputs
 output.html
