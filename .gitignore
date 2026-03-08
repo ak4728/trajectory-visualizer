@@ -1,0 +1,13 @@
+# Large data files
+*.csv
+trajectories*.csv
+
+# Generated outputs
+output.html
+output.png
+
+# IDE/Editor
+.vscode/
+.claude/
+__pycache__/
+*.pyc
