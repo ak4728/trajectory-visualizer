@@ -3,7 +3,6 @@ trajectories.csv
 DroneFootage*.png
 
 # Generated outputs
-output.html
 output.png
 
 # IDE/Editor
