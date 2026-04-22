@@ -821,7 +821,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--alpha", type=float, default=0.9, help="Trajectory opacity")
     parser.add_argument("--legend-limit", type=int, default=30, help="Max legend lane entries")
     parser.add_argument("--lane-threshold", type=float, default=150.0, help="Turn deviation threshold for lane 1 vs 2 (pixels)")
-    parser.add_argument("--title", default="Trajectory Overlay", help="Plot title")
+    parser.add_argument("--title", default="Traffic Tracer", help="Plot title")
     parser.add_argument("--output", help="Optional output file path (PNG/JPG for image, HTML for interactive)")
     parser.add_argument(
         "--format",
